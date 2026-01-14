@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/SimonLariz/beacon/internal/ssh"
@@ -19,6 +20,23 @@ type Connection struct {
 	KeyPath string `json:"key_path,omitempty"` // Optional path to SSH key
 }
 
+// CommandExecution represents a single command execution
+type CommandExecution struct {
+	Command   string        // The command that was executed
+	Timestamp time.Time     // When the command was executed
+	ExitCode  int           // Exit code from command
+	Stdout    string        // Standard output
+	Stderr    string        // Standard error
+	Duration  time.Duration // How long the command took
+	Completed bool          // Whether execution is complete
+}
+
+// CommandHistory stores global command history
+type CommandHistory struct {
+	Commands []string // List of executed commands (for up/down navigation)
+	MaxSize  int      // Maximum number of commands to store
+}
+
 type ConnectionStatus int
 
 const (
@@ -30,24 +48,29 @@ const (
 
 // ConnectionState represents the state of an SSH connection
 type ConnectionState struct {
-	Connection *Connection
-	Client     *ssh.SSHClientWrapper // Wrapper around ssh.Client for managing sessions
-	Status     ConnectionStatus      // Current status of the connection
-	LastActive time.Time             // Timestamp of the last activity
-	LastError  error                 // Error message if any
-	Output     []string              // Recent output from connection
+	Connection  *Connection
+	Client      *ssh.SSHClientWrapper // Wrapper around ssh.Client for managing sessions
+	Status      ConnectionStatus      // Current status of the connection
+	LastActive  time.Time             // Timestamp of the last activity
+	LastError   error                 // Error message if any
+	Output      []string              // Recent output from connection (DEPRECATED)
+	Executions  []*CommandExecution   // Full execution history
+	CurrentExec *CommandExecution     // Currently running command (if any)
 }
 
 // Config represents the saved configuration file structure
 type Config struct {
-	Connections []*Connection `json:"connections"`
+	Connections    []*Connection `json:"connections"`
+	CommandHistory []string      `json:"command_history,omitempty"`
 }
 
 // AppState represents application state
 type AppState struct {
-	Connections   []*ConnectionState // List of all connections
-	SelectedIndex int                // Index of the currently selected connection
-	Config        *Config            // Loaded configuration
+	Connections        []*ConnectionState // List of all connections
+	SelectedIndex      int                // Index of the currently selected connection
+	Config             *Config            // Loaded configuration
+	CommandHistory     *CommandHistory    // Global command history
+	OutputScrollOffset int                // Current scroll position in output
 }
 
 // NewConnection creates a new Connection with defaults
@@ -84,7 +107,12 @@ func NewAppState() *AppState {
 	return &AppState{
 		Connections:   make([]*ConnectionState, 0),
 		SelectedIndex: 0,
-		Config:        &Config{Connections: make([]*Connection, 0)},
+		Config:        &Config{Connections: make([]*Connection, 0), CommandHistory: make([]string, 0)},
+		CommandHistory: &CommandHistory{
+			Commands: make([]string, 0),
+			MaxSize:  1000,
+		},
+		OutputScrollOffset: 0,
 	}
 }
 
@@ -111,7 +139,10 @@ func LoadConfig() (*Config, error) {
 
 	// If file doesn't exist, return empty config
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return &Config{Connections: []*Connection{}}, nil
+		return &Config{
+			Connections:    []*Connection{},
+			CommandHistory: make([]string, 0),
+		}, nil
 	}
 
 	data, err := os.ReadFile(configPath)
@@ -123,6 +154,12 @@ func LoadConfig() (*Config, error) {
 	if err := json.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+
+	// Handle missing CommandHistory field for backwards compatibility
+	if config.CommandHistory == nil {
+		config.CommandHistory = make([]string, 0)
+	}
+
 	return &config, nil
 }
 
@@ -151,6 +188,7 @@ func (app *AppState) AddConnection(conn *Connection) {
 		Connection: conn,
 		Status:     StatusDisconnected,
 		Output:     make([]string, 0),
+		Executions: make([]*CommandExecution, 0),
 	})
 }
 
@@ -193,4 +231,72 @@ func (app *AppState) SelectPrevious() {
 		return
 	}
 	app.SelectedIndex = (app.SelectedIndex - 1 + len(app.Connections)) % len(app.Connections)
+}
+
+// AddToHistory adds a command to global history
+func (app *AppState) AddToHistory(cmd string) {
+	if cmd == "" {
+		return
+	}
+
+	// Avoid duplicates (if last command is same, don't add)
+	if len(app.CommandHistory.Commands) > 0 {
+		last := app.CommandHistory.Commands[len(app.CommandHistory.Commands)-1]
+		if last == cmd {
+			return
+		}
+	}
+
+	app.CommandHistory.Commands = append(app.CommandHistory.Commands, cmd)
+	app.Config.CommandHistory = app.CommandHistory.Commands
+
+	// Enforce max size
+	if len(app.CommandHistory.Commands) > app.CommandHistory.MaxSize {
+		app.CommandHistory.Commands = app.CommandHistory.Commands[1:]
+		app.Config.CommandHistory = app.CommandHistory.Commands
+	}
+}
+
+// GetHistoryItem retrieves command at index (in reverse order, most recent first)
+func (app *AppState) GetHistoryItem(index int) string {
+	if index < 0 || index >= len(app.CommandHistory.Commands) {
+		return ""
+	}
+	// Return in reverse order (most recent first)
+	reverseIndex := len(app.CommandHistory.Commands) - 1 - index
+	return app.CommandHistory.Commands[reverseIndex]
+}
+
+// HistorySize returns the number of commands in history
+func (app *AppState) HistorySize() int {
+	return len(app.CommandHistory.Commands)
+}
+
+// ScrollOutputUp scrolls the output view up by lines
+func (app *AppState) ScrollOutputUp(lines int) {
+	app.OutputScrollOffset += lines
+	// Clamp to max
+	selected := app.GetSelected()
+	if selected != nil && len(selected.Executions) > 0 {
+		// Rough estimate: each execution takes ~3 lines + output lines
+		totalLines := 0
+		for _, exec := range selected.Executions {
+			totalLines += 3 // Command line + separator + exit code
+			totalLines += len(strings.Split(exec.Stdout, "\n"))
+			if exec.Stderr != "" {
+				totalLines += len(strings.Split(exec.Stderr, "\n")) + 1
+			}
+		}
+		if app.OutputScrollOffset > totalLines {
+			app.OutputScrollOffset = totalLines
+		}
+	}
+}
+
+// ScrollOutputDown scrolls the output view down by lines
+func (app *AppState) ScrollOutputDown(lines int) {
+	app.OutputScrollOffset -= lines
+	if app.OutputScrollOffset < 0 {
+		app.OutputScrollOffset = 0
+	}
 }
